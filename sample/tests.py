@@ -1,9 +1,41 @@
+import datetime
+import decimal
+import uuid
+
 from django.apps import apps
 from django.contrib.auth.models import Group, Permission, User
 from django.contrib.contenttypes.models import ContentType
-from django.db import IntegrityError, connection, transaction
+from django.db import IntegrityError, connection, models, transaction
 from django.db.models import Count
 from django.test import TestCase, TransactionTestCase
+
+from sample.models import (
+    AutoFieldModel,
+    BigAutoFieldModel,
+    BigIntegerFieldModel,
+    BinaryFieldModel,
+    BooleanFieldModel,
+    CharFieldModel,
+    DateFieldModel,
+    DateTimeFieldModel,
+    DecimalFieldModel,
+    DurationFieldModel,
+    FileFieldModel,
+    FilePathFieldModel,
+    FloatFieldModel,
+    GenericIPAddressFieldModel,
+    IntegerFieldModel,
+    JSONFieldModel,
+    PositiveBigIntegerFieldModel,
+    PositiveIntegerFieldModel,
+    PositiveSmallIntegerFieldModel,
+    SlugFieldModel,
+    SmallAutoFieldModel,
+    SmallIntegerFieldModel,
+    TextFieldModel,
+    TimeFieldModel,
+    UUIDFieldModel,
+)
 
 
 class SampleProjectSetupTests(TestCase):
@@ -199,3 +231,56 @@ class TransactionTests(TransactionTestCase):
         with transaction.atomic():
             User.objects.create_user(username="committed", password="x")
         self.assertTrue(User.objects.filter(username="committed").exists())
+
+
+class ModelConstructionTests(TestCase):
+    FIELD_MODEL_CASES = [
+        (AutoFieldModel, models.AutoField, "id", 1),
+        (BigAutoFieldModel, models.BigAutoField, "id", 2),
+        (SmallAutoFieldModel, models.SmallAutoField, "id", 3),
+        (BinaryFieldModel, models.BinaryField, "value", b"\x00\x01"),
+        (BooleanFieldModel, models.BooleanField, "value", True),
+        (CharFieldModel, models.CharField, "value", "hello"),
+        (DateFieldModel, models.DateField, "value", datetime.date(2026, 11, 7)),
+        (
+            DateTimeFieldModel,
+            models.DateTimeField,
+            "value",
+            datetime.datetime(2026, 11, 7, 11, 33, tzinfo=datetime.timezone.utc),
+        ),
+        (DecimalFieldModel, models.DecimalField, "value", decimal.Decimal("12.34")),
+        (DurationFieldModel, models.DurationField, "value", datetime.timedelta(days=1)),
+        (FileFieldModel, models.FileField, "value", "uploads/readme.txt"),
+        (FilePathFieldModel, models.FilePathField, "value", "tests.py"),
+        (FloatFieldModel, models.FloatField, "value", 1.5),
+        (GenericIPAddressFieldModel, models.GenericIPAddressField, "value", "::1"),
+        (IntegerFieldModel, models.IntegerField, "value", -5),
+        (BigIntegerFieldModel, models.BigIntegerField, "value", 2**40),
+        (SmallIntegerFieldModel, models.SmallIntegerField, "value", -7),
+        (PositiveBigIntegerFieldModel, models.PositiveBigIntegerField, "value", 2**40),
+        (PositiveIntegerFieldModel, models.PositiveIntegerField, "value", 5),
+        (PositiveSmallIntegerFieldModel, models.PositiveSmallIntegerField, "value", 6),
+        (JSONFieldModel, models.JSONField, "value", {"key": ["a", 1]}),
+        (SlugFieldModel, models.SlugField, "value", "my-slug"),
+        (TextFieldModel, models.TextField, "value", "long text"),
+        (TimeFieldModel, models.TimeField, "value", datetime.time(11, 33)),
+        (UUIDFieldModel, models.UUIDField, "value", uuid.UUID(int=1)),
+    ]
+
+    def test_every_model_can_be_constructed(self):
+        for model, field_class, attr, value in self.FIELD_MODEL_CASES:
+            with self.subTest(model=model.__name__):
+                instance = model(**{attr: value})
+                self.assertIsInstance(instance, model)
+                self.assertIsInstance(model._meta.get_field(attr), field_class)
+                self.assertEqual(getattr(instance, attr), value)
+
+    def test_unsaved_model_has_no_primary_key(self):
+        for model, _, _, _ in self.FIELD_MODEL_CASES:
+            with self.subTest(model=model.__name__):
+                self.assertIsNone(model().pk)
+
+    def test_every_backend_field_type_has_a_model(self):
+        covered = {field_class.__name__ for _, field_class, _, _ in self.FIELD_MODEL_CASES}
+        expected = set(connection.data_types) - {"IPAddressField"}
+        self.assertEqual(covered, expected)

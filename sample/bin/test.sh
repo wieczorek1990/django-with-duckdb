@@ -1,5 +1,5 @@
 #!/bin/sh
-# Test runner.
+# Tests.
 
-source .venv/bin/activate
-python3 ./manage.py test --noinput
+source ./.venv/bin/activate
+python3 manage.py test --noinput
