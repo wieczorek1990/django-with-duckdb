@@ -275,6 +275,16 @@ class ModelConstructionTests(TestCase):
                 self.assertIsInstance(model._meta.get_field(attr), field_class)
                 self.assertEqual(getattr(instance, attr), value)
 
+    def test_every_model_round_trips_field_value(self):
+        for model, _, attr, value in self.FIELD_MODEL_CASES:
+            with self.subTest(model=model.__name__):
+                instance = model(**{attr: value})
+                instance.save()
+
+                loaded = model.objects.get(pk=instance.pk)
+                self.assertEqual(loaded.pk, instance.pk)
+                self.assertEqual(getattr(loaded, attr), value)
+
     def test_unsaved_model_has_no_primary_key(self):
         for model, _, _, _ in self.FIELD_MODEL_CASES:
             with self.subTest(model=model.__name__):
