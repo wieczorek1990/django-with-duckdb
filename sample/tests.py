@@ -1,5 +1,5 @@
 from django.apps import apps
-from django.contrib.auth.models import Permission, User
+from django.contrib.auth.models import Group, Permission, User
 from django.contrib.contenttypes.models import ContentType
 from django.db import IntegrityError, connection, transaction
 from django.db.models import Count
@@ -94,7 +94,90 @@ class UserOrmTests(TestCase):
         self.assertEqual(User.objects.filter(username__startswith="user").count(), 5)
 
 
+class GroupPermissionModelTests(TestCase):
+    def setUp(self):
+        self.alice = User.objects.create_user(
+            username="alice",
+            password="secret-1",
+            first_name="Alice",
+            last_name="Smith",
+        )
+        self.editors = Group.objects.create(name="editors")
+        self.add_user_perm = Permission.objects.get(
+            codename="add_user", content_type__app_label="auth"
+        )
+
+    def test_user_str_and_full_name(self):
+        self.assertEqual(str(self.alice), "alice")
+        self.assertEqual(self.alice.get_full_name(), "Alice Smith")
+
+    def test_user_can_join_group_idempotently(self):
+        self.alice.groups.add(self.editors)
+        self.alice.groups.add(self.editors)
+        self.assertEqual(self.alice.groups.count(), 1)
+        self.assertIn(self.alice, self.editors.user_set.all())
+
+    def test_filter_users_by_group_name(self):
+        self.alice.groups.add(self.editors)
+        User.objects.create_user(username="bob", password="secret-2")
+        names = list(
+            User.objects.filter(groups__name="editors").values_list(
+                "username", flat=True
+            )
+        )
+        self.assertEqual(names, ["alice"])
+
+    def test_group_member_count_annotation(self):
+        self.alice.groups.add(self.editors)
+        group = Group.objects.annotate(members=Count("user")).get(name="editors")
+        self.assertEqual(group.members, 1)
+
+    def test_group_permission_is_granted_to_member(self):
+        self.editors.permissions.add(self.add_user_perm)
+        self.alice.groups.add(self.editors)
+        user = User.objects.get(pk=self.alice.pk)
+        self.assertTrue(user.has_perm("auth.add_user"))
+        self.assertFalse(user.has_perm("auth.delete_user"))
+
+    def test_removing_membership_revokes_group_permission(self):
+        self.editors.permissions.add(self.add_user_perm)
+        self.alice.groups.add(self.editors)
+        self.alice.groups.remove(self.editors)
+        user = User.objects.get(pk=self.alice.pk)
+        self.assertFalse(user.has_perm("auth.add_user"))
+
+    def test_direct_user_permission_is_granted(self):
+        self.alice.user_permissions.add(self.add_user_perm)
+        user = User.objects.get(pk=self.alice.pk)
+        self.assertTrue(user.has_perm("auth.add_user"))
+        self.assertIn(self.add_user_perm, user.user_permissions.all())
+
+    def test_deleting_group_keeps_user(self):
+        self.alice.groups.add(self.editors)
+        self.editors.delete()
+        self.assertTrue(User.objects.filter(pk=self.alice.pk).exists())
+        self.assertEqual(User.objects.get(pk=self.alice.pk).groups.count(), 0)
+
+    def test_permission_belongs_to_expected_content_type(self):
+        self.assertEqual(self.add_user_perm.codename, "add_user")
+        self.assertEqual(self.add_user_perm.content_type.app_label, "auth")
+        self.assertEqual(self.add_user_perm.content_type.model, "user")
+        self.assertIs(self.add_user_perm.content_type.model_class(), User)
+
+    def test_content_type_lookup_for_user_model(self):
+        content_type = ContentType.objects.get_for_model(User)
+        self.assertEqual(content_type.app_label, "auth")
+        self.assertEqual(content_type.model, "user")
+
+
 class TransactionTests(TransactionTestCase):
+    def test_group_name_is_unique(self):
+        Group.objects.create(name="editors")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Group.objects.create(name="editors")
+        self.assertEqual(Group.objects.filter(name="editors").count(), 1)
+
     def test_unique_username_is_enforced(self):
         User.objects.create_user(username="alice", password="x")
         with self.assertRaises(IntegrityError):
