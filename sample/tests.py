@@ -235,25 +235,27 @@ class TransactionTests(TransactionTestCase):
 
 
 class SchemaEditorTests(TransactionTestCase):
-    def create_test_model(self):
+    def create_test_model(self, fields=None, app_registry=None):
         table_name = f"schema_editor_{uuid.uuid4().hex}"
         meta = type(
             "Meta",
             (),
             {
                 "app_label": "schema_editor_tests",
-                "apps": Apps(),
+                "apps": app_registry or Apps(),
                 "db_table": table_name,
             },
         )
+        model_fields = {
+            "value": models.IntegerField(null=True),
+            **(fields or {}),
+            "__module__": __name__,
+            "Meta": meta,
+        }
         model = type(
             f"SchemaEditorModel{uuid.uuid4().hex}",
             (models.Model,),
-            {
-                "__module__": __name__,
-                "value": models.IntegerField(null=True),
-                "Meta": meta,
-            },
+            model_fields,
         )
         with connection.schema_editor() as schema_editor:
             schema_editor.create_model(model)
@@ -262,6 +264,12 @@ class SchemaEditorTests(TransactionTestCase):
 
     def delete_test_model(self, model):
         with connection.schema_editor() as schema_editor:
+            for field in model._meta.local_many_to_many:
+                if field.remote_field.through._meta.auto_created:
+                    schema_editor.execute(
+                        "DROP TABLE IF EXISTS "
+                        f"{schema_editor.quote_name(field.m2m_db_table())}"
+                    )
             table_names = {
                 model._meta.db_table,
                 getattr(model, "_schema_editor_new_table", model._meta.db_table),
@@ -276,6 +284,92 @@ class SchemaEditorTests(TransactionTestCase):
                 schema_editor.execute(
                     f"DROP SEQUENCE IF EXISTS {schema_editor.quote_name(seq_name)}"
                 )
+
+    def test_foreign_keys_enforce_references_and_respect_db_constraint(self):
+        parent = self.create_test_model()
+        parent_instance = parent.objects.create(value=1)
+        child = self.create_test_model(
+            {
+                "parent": models.ForeignKey(
+                    parent, on_delete=models.CASCADE, null=True
+                )
+            }
+        )
+
+        child.objects.create(parent=parent_instance)
+        child.objects.create(parent=None)
+        with self.assertRaises(IntegrityError):
+            child.objects.create(parent_id=parent_instance.pk + 100)
+
+        unconstrained = self.create_test_model(
+            {
+                "parent": models.ForeignKey(
+                    parent,
+                    on_delete=models.CASCADE,
+                    null=True,
+                    db_constraint=False,
+                )
+            }
+        )
+        orphan = unconstrained.objects.create(parent_id=parent_instance.pk + 100)
+        self.assertEqual(orphan.parent_id, parent_instance.pk + 100)
+
+    def test_adding_foreign_key_during_table_rebuild_enforces_references(self):
+        parent = self.create_test_model()
+        parent_instance = parent.objects.create(value=1)
+        child = self.create_test_model()
+        existing = child.objects.create(value=2)
+        field = models.ForeignKey(parent, on_delete=models.CASCADE, null=True)
+        field.set_attributes_from_name("parent")
+        field.model = child
+
+        with connection.schema_editor() as schema_editor:
+            schema_editor.add_field(child, field)
+
+        child.add_to_class("parent", field)
+        self.assertIsNone(child.objects.get(pk=existing.pk).parent_id)
+        linked_child = child.objects.create(parent=parent_instance)
+        self.assertEqual(linked_child.parent_id, parent_instance.pk)
+        with self.assertRaises(IntegrityError):
+            child.objects.create(parent_id=parent_instance.pk + 100)
+
+    def test_rebuilding_referenced_table_restores_dependent_foreign_keys(self):
+        app_registry = Apps()
+        tag = self.create_test_model(app_registry=app_registry)
+        parent = self.create_test_model(
+            {"tags": models.ManyToManyField(tag)}, app_registry=app_registry
+        )
+        parent_instance = parent.objects.create(value=1)
+        tag_instance = tag.objects.create(value=2)
+        parent_instance.tags.add(tag_instance)
+        child = self.create_test_model(
+            {
+                "parent": models.ForeignKey(
+                    parent, on_delete=models.CASCADE, null=True
+                )
+            },
+            app_registry=app_registry,
+        )
+        child_instance = child.objects.create(parent=parent_instance)
+        old_field = parent._meta.get_field("value")
+        new_field = models.BigIntegerField(null=True)
+        new_field.set_attributes_from_name("value")
+        new_field.model = parent
+
+        with connection.schema_editor() as schema_editor:
+            schema_editor.alter_field(parent, old_field, new_field)
+
+        self.assertEqual(
+            child.objects.get(pk=child_instance.pk).parent_id, parent_instance.pk
+        )
+        through_table = parent._meta.get_field("tags").m2m_db_table()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT COUNT(*) FROM {connection.ops.quote_name(through_table)}"
+            )
+            self.assertEqual(cursor.fetchone()[0], 1)
+        with self.assertRaises(IntegrityError):
+            child.objects.create(parent_id=parent_instance.pk + 100)
 
     def test_same_name_table_alter_preserves_auto_increment_sequence(self):
         model = self.create_test_model()
