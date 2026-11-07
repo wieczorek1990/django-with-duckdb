@@ -3,6 +3,7 @@ import decimal
 import uuid
 
 from django.apps import apps
+from django.apps.registry import Apps
 from django.contrib.auth.models import Group, Permission, User
 from django.contrib.contenttypes.models import ContentType
 from django.db import IntegrityError, connection, models, transaction
@@ -231,6 +232,131 @@ class TransactionTests(TransactionTestCase):
         with transaction.atomic():
             User.objects.create_user(username="committed", password="x")
         self.assertTrue(User.objects.filter(username="committed").exists())
+
+
+class SchemaEditorTests(TransactionTestCase):
+    def create_test_model(self):
+        table_name = f"schema_editor_{uuid.uuid4().hex}"
+        meta = type(
+            "Meta",
+            (),
+            {
+                "app_label": "schema_editor_tests",
+                "apps": Apps(),
+                "db_table": table_name,
+            },
+        )
+        model = type(
+            f"SchemaEditorModel{uuid.uuid4().hex}",
+            (models.Model,),
+            {
+                "__module__": __name__,
+                "value": models.IntegerField(null=True),
+                "Meta": meta,
+            },
+        )
+        with connection.schema_editor() as schema_editor:
+            schema_editor.create_model(model)
+        self.addCleanup(self.delete_test_model, model)
+        return model
+
+    def delete_test_model(self, model):
+        with connection.schema_editor() as schema_editor:
+            table_names = {
+                model._meta.db_table,
+                getattr(model, "_schema_editor_new_table", model._meta.db_table),
+            }
+            for table_name in table_names:
+                schema_editor.execute(
+                    f"DROP TABLE IF EXISTS {schema_editor.quote_name(table_name)}"
+                )
+                seq_name = schema_editor._sequence_name(
+                    table_name, model._meta.pk.column
+                )
+                schema_editor.execute(
+                    f"DROP SEQUENCE IF EXISTS {schema_editor.quote_name(seq_name)}"
+                )
+
+    def test_same_name_table_alter_preserves_auto_increment_sequence(self):
+        model = self.create_test_model()
+        original = model.objects.create(value=1)
+
+        with connection.schema_editor() as schema_editor:
+            schema_editor.alter_db_table(
+                model, model._meta.db_table, model._meta.db_table
+            )
+
+        next_instance = model.objects.create(value=2)
+        self.assertEqual(next_instance.pk, original.pk + 1)
+
+    def test_table_rename_preserves_auto_increment_sequence(self):
+        model = self.create_test_model()
+        original = model.objects.create(value=1)
+        old_table = model._meta.db_table
+        new_table = f"{old_table}_renamed"
+        model._schema_editor_new_table = new_table
+
+        with connection.schema_editor() as schema_editor:
+            schema_editor.alter_db_table(model, old_table, new_table)
+
+        model._meta.db_table = new_table
+        next_instance = model.objects.create(value=2)
+        self.assertEqual(next_instance.pk, original.pk + 1)
+
+    def test_add_non_null_fields_with_temporal_and_uuid_defaults(self):
+        field_cases = (
+            (
+                "created_at",
+                models.DateTimeField,
+                datetime.datetime(2024, 1, 15, 10, 0, tzinfo=datetime.timezone.utc),
+            ),
+            ("at_time", models.TimeField, datetime.time(10, 30, 15)),
+            ("external_id", models.UUIDField, uuid.UUID(int=1)),
+            ("duration", models.DurationField, datetime.timedelta(days=1, seconds=2)),
+        )
+        for field_name, field_class, value in field_cases:
+            with self.subTest(field=field_name):
+                model = self.create_test_model()
+                existing = model.objects.create(value=1)
+                field = field_class(default=value, null=False)
+                field.set_attributes_from_name(field_name)
+                field.model = model
+
+                with connection.schema_editor() as schema_editor:
+                    schema_editor.add_field(model, field)
+
+                model.add_to_class(field_name, field)
+                loaded = model.objects.get(pk=existing.pk)
+                self.assertEqual(getattr(loaded, field_name), value)
+
+    def test_altering_nullability_and_removing_field_preserve_rows(self):
+        model = self.create_test_model()
+        original = model.objects.create(value=1)
+        old_field = model._meta.get_field("value")
+        new_field = old_field.clone()
+        new_field.null = False
+        new_field.set_attributes_from_name(old_field.name)
+        new_field.model = model
+
+        with connection.schema_editor() as schema_editor:
+            schema_editor.alter_field(model, old_field, new_field)
+
+        loaded = model.objects.get(pk=original.pk)
+        self.assertEqual(loaded.value, 1)
+        next_instance = model.objects.create(value=2)
+        self.assertEqual(next_instance.pk, original.pk + 1)
+
+        with connection.schema_editor() as schema_editor:
+            schema_editor.remove_field(model, new_field)
+
+        with connection.cursor() as cursor:
+            description = connection.introspection.get_table_description(
+                cursor, model._meta.db_table
+            )
+        self.assertEqual({column.name for column in description}, {"id"})
+        with connection.cursor() as cursor:
+            cursor.execute(f'SELECT COUNT(*) FROM "{model._meta.db_table}"')
+            self.assertEqual(cursor.fetchone()[0], 2)
 
 
 class ModelConstructionTests(TestCase):
