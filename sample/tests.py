@@ -27,7 +27,9 @@ class SampleProjectSetupTests(TestCase):
             ContentType.objects.filter(app_label="auth", model="user").exists()
         )
         self.assertTrue(
-            Permission.objects.filter(codename="add_user", content_type__app_label="auth").exists()
+            Permission.objects.filter(
+                codename="add_user", content_type__app_label="auth"
+            ).exists()
         )
 
 
@@ -71,7 +73,9 @@ class UserOrmTests(TestCase):
         self.assertEqual(User.objects.count(), 1)
 
     def test_ordering_and_values_list(self):
-        names = list(User.objects.order_by("username").values_list("username", flat=True))
+        names = list(
+            User.objects.order_by("username").values_list("username", flat=True)
+        )
         self.assertEqual(names, ["alice", "bob"])
 
     def test_aggregate_count_grouped_by_active_flag(self):
@@ -85,9 +89,7 @@ class UserOrmTests(TestCase):
         self.assertEqual(result, {False: 1, True: 1})
 
     def test_bulk_create(self):
-        User.objects.bulk_create(
-            [User(username=f"user{i}") for i in range(5)]
-        )
+        User.objects.bulk_create([User(username=f"user{i}") for i in range(5)])
         self.assertEqual(User.objects.count(), 7)
         self.assertEqual(User.objects.filter(username__startswith="user").count(), 5)
 
